@@ -190,6 +190,7 @@
       <button class="primary" id="saveBtn">儲存影片</button>
       <button class="ghost" id="discardBtn">刪除重錄</button>
     </div>
+    <p class="hint" id="diag" hidden></p>
     <p class="hint" id="saveHint">iPhone：按「儲存影片」後選「儲存影片」就會存到照片 App。</p>
   </div>
 </div>
@@ -354,7 +355,7 @@
     const vcfg = { codec: 'avc1.640028', width: w, height: h, bitrate, framerate: 30, latencyMode: 'quality', avc: { format: 'avc' } };
     if (!(await VideoEncoder.isConfigSupported(vcfg)).supported) throw new Error('video config unsupported');
     const sr = actx.sampleRate;
-    const acfg = { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: 1, bitrate: 128000 };
+    const acfg = { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: 1, bitrate: 128000, aac: { format: 'aac' } };
     if (!(await AudioEncoder.isConfigSupported(acfg)).supported) throw new Error('audio config unsupported');
 
     const sink = makeSink();
@@ -368,26 +369,45 @@
     let failed = null;
     const venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => failed = e });
     venc.configure(vcfg);
-    const aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: (e) => failed = e });
+    const aenc = new AudioEncoder({ output: (c, m) => { muxer.addAudioChunk(c, m); diagChunks++; }, error: (e) => failed = e });
+    let diagChunks = 0;
     aenc.configure(acfg);
 
-    // Audio: mic → worklet → AAC, timestamps from the sample count
-    const src = actx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
-    const node = new AudioWorkletNode(actx, 'cap');
-    const mute = actx.createGain(); mute.gain.value = 0;
-    src.connect(node); node.connect(mute); mute.connect(actx.destination);
-    let samples = 0, pend = [], pendLen = 0;
+    // Audio: mic → worklet (or ScriptProcessor fallback) → AAC, timestamps from the sample count
+    const diag = { captured: 0, chunks: 0, path: 'worklet', state: actx.state, err: '', peak: 0 };
+    const keepAlive = () => { if (actx.state !== 'running' && actx.state !== 'closed') actx.resume().catch(() => {}); };
+    actx.onstatechange = () => { diag.state = actx.state; keepAlive(); };
+    keepAlive();
+    const micTrack = stream.getAudioTracks()[0];
+    if (!micTrack) throw new Error('no mic track');
+    const src = actx.createMediaStreamSource(new MediaStream([micTrack]));
+    const mute = actx.createGain(); mute.gain.value = 0; mute.connect(actx.destination);
+    let samples = 0, pend = [], pendLen = 0, gotAudio = false, node = null, sp = null;
     function flushAudio() {
       if (!pendLen) return;
       const buf = new Float32Array(pendLen); let o = 0;
       for (const p of pend) { buf.set(p, o); o += p.length; }
       const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: pendLen, numberOfChannels: 1,
         timestamp: Math.round(samples * 1e6 / sr), data: buf });
-      aenc.encode(ad); ad.close();
-      samples += pendLen; pend = []; pendLen = 0;
+      try { aenc.encode(ad); } catch (e) { diag.err = String(e && e.message || e); }
+      ad.close();
+      samples += pendLen; diag.captured = samples / sr; pend = []; pendLen = 0;
     }
-    node.port.onmessage = (e) => { pend.push(e.data); pendLen += e.data.length; if (pendLen >= 2048) flushAudio(); };
-
+    function onPcm(f32) { gotAudio = true; for (let i = 0; i < f32.length; i += 16) { const v = Math.abs(f32[i]); if (v > diag.peak) diag.peak = v; } pend.push(f32); pendLen += f32.length; if (pendLen >= 2048) flushAudio(); }
+    function useScriptProcessor() {
+      if (sp) return;
+      try { node && (node.port.onmessage = null, src.disconnect(node), node.disconnect()); } catch {}
+      node = null; diag.path = 'script';
+      sp = actx.createScriptProcessor(2048, 1, 1);
+      sp.onaudioprocess = (e) => onPcm(new Float32Array(e.inputBuffer.getChannelData(0)));
+      src.connect(sp); sp.connect(mute);
+    }
+    try {
+      node = new AudioWorkletNode(actx, 'cap');
+      node.port.onmessage = (e) => onPcm(e.data);
+      src.connect(node); node.connect(mute);
+    } catch { useScriptProcessor(); }
+    const audioWatch = setTimeout(() => { if (!gotAudio) { keepAlive(); useScriptProcessor(); } }, 800);
     // Video: fixed 30fps timeline
     const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext('2d', { alpha: false });
@@ -408,13 +428,17 @@
       mode: 'cfr',
       async stop() {
         clearInterval(iv); pump();
-        node.port.onmessage = null; flushAudio();
-        try { src.disconnect(); node.disconnect(); mute.disconnect(); } catch {}
+        clearTimeout(audioWatch);
+        if (node) node.port.onmessage = null;
+        if (sp) sp.onaudioprocess = null;
+        flushAudio();
+        try { src.disconnect(); node && node.disconnect(); sp && sp.disconnect(); mute.disconnect(); } catch {}
         await venc.flush(); await aenc.flush();
         muxer.finalize();
         venc.close(); aenc.close(); actx.close().catch(() => {});
         if (failed) throw failed;
-        return { blob: sink.blob('video/mp4'), ext: 'mp4' };
+        diag.chunks = diagChunks;
+        return { blob: sink.blob('video/mp4'), ext: 'mp4', diag };
       }
     };
   }
@@ -452,11 +476,11 @@
     if (!stream) { toast('相機還沒準備好'); return; }
     // AudioContext must be created inside the tap
     let actx = null;
-    if (s.cfr && 'AudioContext' in window) { try { actx = new AudioContext(); actx.resume(); } catch { actx = null; } }
+    if (s.cfr && 'AudioContext' in window) { try { actx = new AudioContext(); actx.resume().catch(() => {}); } catch { actx = null; } }
     $('recBtn').disabled = true;
     scroller.scrollTop = 0; setRunning(false);
     const cfrOk = actx && await CFR_SUPPORTED;
-    if (cfrOk) { try { await prepareAudio(actx); } catch (e) { console.warn(e); } }
+    if (cfrOk) { try { await actx.resume(); } catch {} try { await prepareAudio(actx); } catch (e) { console.warn(e); } }
     await countdown();
     session = null;
     if (cfrOk) {
@@ -483,8 +507,8 @@
     $('recBtn').disabled = true;
     const s0 = session; session = null;
     try {
-      const { blob, ext } = await s0.stop();
-      lastExt = ext; showResult(blob, s0.mode);
+      const { blob, ext, diag } = await s0.stop();
+      lastExt = ext; showResult(blob, s0.mode, diag);
     } catch (e) {
       console.error(e); toast('存檔失敗，請再錄一次');
     }
@@ -501,12 +525,17 @@
     return `提詞錄影_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${lastExt}`;
   }
   let lastUrl = '';
-  function showResult(blob, mode) {
+  function showResult(blob, mode, diag) {
     lastBlob = blob;
     if (lastUrl) URL.revokeObjectURL(lastUrl);
     lastUrl = URL.createObjectURL(lastBlob);
     $('playback').src = lastUrl;
     $('resultInfo').textContent = (lastBlob.size / 1048576).toFixed(1) + ' MB・' + (mode === 'cfr' ? '剪輯友善 30fps' : '一般模式');
+    const d = $('diag');
+    if (diag) {
+      d.textContent = `聲音 ${diag.captured.toFixed(1)} 秒・${diag.chunks} 段・音量 ${Math.round(diag.peak * 100)}%・${diag.path}・${diag.state}${diag.err ? '・' + diag.err : ''}`;
+      d.hidden = false;
+    } else d.hidden = true;
     $('result').hidden = false;
   }
   async function saveVideo() {
