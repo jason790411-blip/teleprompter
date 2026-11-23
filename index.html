@@ -346,6 +346,12 @@
     try { await actx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
   }
 
+  function makeAsc(rate, ch) {
+    const idx = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350].indexOf(rate);
+    if (idx < 0) throw new Error('unsupported sample rate ' + rate);
+    return new Uint8Array([(2 << 3) | (idx >> 1), ((idx & 1) << 7) | (ch << 3)]);
+  }
+
   async function startCfr(actx) {
     let w = cam.videoWidth, h = cam.videoHeight;
     if (!w || !h) throw new Error('no video size');
@@ -369,7 +375,13 @@
     let failed = null;
     const venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => failed = e });
     venc.configure(vcfg);
-    const aenc = new AudioEncoder({ output: (c, m) => { muxer.addAudioChunk(c, m); diagChunks++; }, error: (e) => failed = e });
+    // Safari hands back a whole ES_Descriptor as the AAC "description"; players then can't decode the track.
+    // Always write a plain 2-byte AudioSpecificConfig (AAC-LC, mono) instead.
+    const asc = makeAsc(sr, 1);
+    const aenc = new AudioEncoder({ output: (c, m) => {
+      if (m && m.decoderConfig) m = { ...m, decoderConfig: { ...m.decoderConfig, description: asc } };
+      muxer.addAudioChunk(c, m); diagChunks++;
+    }, error: (e) => failed = e });
     let diagChunks = 0;
     aenc.configure(acfg);
 
