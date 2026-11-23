@@ -176,7 +176,8 @@
     <p class="hint">
       點字幕可以暫停或繼續，用手指上下滑可以調整位置。<br>
       藍牙遙控器或鍵盤：空白鍵／Enter 暫停或繼續，↑↓ 加減速，←→ 倒回或往前一點，R 開始或停止錄影。<br>
-      字幕只會顯示在螢幕上，不會錄進影片裡。講稿只存在這支手機的瀏覽器裡。
+      字幕只會顯示在螢幕上，不會錄進影片裡。講稿只存在這支手機的瀏覽器裡。<br>
+      <span id="ver"></span>
     </p>
   </div>
 </div>
@@ -200,6 +201,7 @@
 <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.min.js"></script>
 <script>
 (() => {
+  const VERSION = 'v4（11/24 音訊修正）';
   const $ = (id) => document.getElementById(id);
   const cam = $('cam'), scroller = $('scroller'), textEl = $('text');
   const store = {
@@ -545,7 +547,7 @@
     $('resultInfo').textContent = (lastBlob.size / 1048576).toFixed(1) + ' MB・' + (mode === 'cfr' ? '剪輯友善 30fps' : '一般模式');
     const d = $('diag');
     if (diag) {
-      d.textContent = `聲音 ${diag.captured.toFixed(1)} 秒・${diag.chunks} 段・音量 ${Math.round(diag.peak * 100)}%・${diag.path}・${diag.state}${diag.err ? '・' + diag.err : ''}`;
+      d.textContent = `${VERSION}・聲音 ${diag.captured.toFixed(1)} 秒・${diag.chunks} 段・音量 ${Math.round(diag.peak * 100)}%・${diag.path}・${diag.state}${diag.err ? '・' + diag.err : ''}`;
       d.hidden = false;
     } else d.hidden = true;
     $('result').hidden = false;
@@ -619,6 +621,7 @@
     }
   });
 
+  $('ver').textContent = '版本 ' + VERSION;
   renderText(); applyStyle(); startCamera();
 })();
 </script>
