@@ -171,6 +171,7 @@
     <div class="toggles">
       <button class="chip" id="tMirror" aria-pressed="true">預覽畫面鏡像</button>
       <button class="chip" id="tHD" aria-pressed="true">高畫質 1080p</button>
+      <button class="chip" id="tCfr" aria-pressed="true">剪輯友善模式（固定 30fps）</button>
     </div>
     <p class="hint">
       點字幕可以暫停或繼續，用手指上下滑可以調整位置。<br>
@@ -195,6 +196,7 @@
 
 <div id="toast" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.min.js"></script>
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -210,7 +212,7 @@
     script: store.get('script', SAMPLE),
     fs: store.get('fs', 30), speed: store.get('speed', 5), ph: store.get('ph', 42), dim: store.get('dim', 60),
     center: store.get('center', false), flipText: store.get('flipText', false), countdown: store.get('countdown', true),
-    mirror: store.get('mirror', true), hd: store.get('hd', true), facing: store.get('facing', 'user'),
+    mirror: store.get('mirror', true), hd: store.get('hd', true), cfr: store.get('cfr', true), facing: store.get('facing', 'user'),
   };
 
   // ---------- Prompter display ----------
@@ -263,6 +265,15 @@
   async function startCamera() {
     if (stream) stream.getTracks().forEach(t => t.stop());
     const msg = $('camMsg');
+    if (location.hash === '#test') { // test-only fake camera + tone, used for desktop checks
+      const c = document.createElement('canvas'); c.width = 1080; c.height = 1920;
+      const g = c.getContext('2d'); let i = 0;
+      setInterval(() => { g.fillStyle = `hsl(${(i++ * 7) % 360} 60% 40%)`; g.fillRect(0, 0, 1080, 1920); g.fillStyle = '#fff'; g.font = '200px sans-serif'; g.fillText(i, 300, 1000); }, 33);
+      const ac = new AudioContext(), osc = ac.createOscillator(), dst = ac.createMediaStreamDestination();
+      osc.connect(dst); osc.start();
+      stream = new MediaStream([...c.captureStream(30).getVideoTracks(), ...dst.stream.getAudioTracks()]);
+      cam.srcObject = stream; msg.hidden = true; await cam.play().catch(() => {}); applyStyle(); return;
+    }
     if (!navigator.mediaDevices?.getUserMedia) {
       msg.hidden = false;
       msg.innerHTML = '這個瀏覽器不能開相機。<br>請確認網址是 <b>https://</b> 開頭，並用 Safari 或 Chrome 開啟。';
@@ -288,32 +299,174 @@
   }
 
   // ---------- Recording ----------
-  let recorder = null, chunks = [], recording = false, recStart = 0, timer = 0, lastBlob = null, lastExt = 'mp4';
-  function pickType() {
-    const types = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-    for (const t of types) if (window.MediaRecorder && MediaRecorder.isTypeSupported?.(t)) return t;
-    return '';
+  // Two engines:
+  //  • "cfr" (edit-friendly): draw camera to a canvas, encode with WebCodecs at exactly 30fps
+  //    (fixed timestamps, missing frames are filled by repeating the last one), orientation baked in,
+  //    AAC audio, muxed to MP4. This is what editors like 剪映 handle smoothly.
+  //  • "mr" (fallback): the browser's MediaRecorder, variable frame rate.
+  let recording = false, recStart = 0, timer = 0, lastBlob = null, lastExt = 'mp4', session = null;
+
+  const CFR_SUPPORTED = (async () => {
+    try {
+      if (!('VideoEncoder' in window) || !('AudioEncoder' in window) || !('AudioWorkletNode' in window) || !window.Mp4Muxer) return false;
+      const v = await VideoEncoder.isConfigSupported({ codec: 'avc1.640028', width: 1080, height: 1920, bitrate: 8e6, framerate: 30 });
+      const a = await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1, bitrate: 128000 });
+      return !!(v.supported && a.supported);
+    } catch { return false; }
+  })();
+
+  // Collects StreamTarget writes (mostly appends, plus a few back-patches) into ordered byte segments.
+  function makeSink() {
+    const segs = []; let end = 0;
+    function write(data, pos) {
+      if (pos > end) { segs.push(new Uint8Array(pos - end)); end = pos; }
+      let offset = 0;
+      if (pos < end) { // overwrite bytes already written
+        let segStart = 0;
+        for (const seg of segs) {
+          const segEnd = segStart + seg.length;
+          if (segEnd > pos && segStart < pos + data.length) {
+            const from = Math.max(pos, segStart), to = Math.min(pos + data.length, segEnd);
+            seg.set(data.subarray(from - pos, to - pos), from - segStart);
+          }
+          segStart = segEnd;
+        }
+        offset = Math.min(data.length, end - pos);
+      }
+      if (offset < data.length) { segs.push(data.slice(offset)); end += data.length - offset; }
+    }
+    return { write, blob: (type) => new Blob(segs, { type }) };
   }
+
+  const WORKLET = 'class Cap extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}}registerProcessor("cap",Cap);';
+
+  async function prepareAudio(actx) {
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+    try { await actx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+  }
+
+  async function startCfr(actx) {
+    let w = cam.videoWidth, h = cam.videoHeight;
+    if (!w || !h) throw new Error('no video size');
+    const k = Math.min(1, 1920 / Math.max(w, h));
+    w = Math.round(w * k / 2) * 2; h = Math.round(h * k / 2) * 2;
+    const bitrate = s.hd ? 10e6 : 5e6;
+    const vcfg = { codec: 'avc1.640028', width: w, height: h, bitrate, framerate: 30, latencyMode: 'quality', avc: { format: 'avc' } };
+    if (!(await VideoEncoder.isConfigSupported(vcfg)).supported) throw new Error('video config unsupported');
+    const sr = actx.sampleRate;
+    const acfg = { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: 1, bitrate: 128000 };
+    if (!(await AudioEncoder.isConfigSupported(acfg)).supported) throw new Error('audio config unsupported');
+
+    const sink = makeSink();
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.StreamTarget({ onData: (d, p) => sink.write(d, p), chunked: true, chunkSize: 4 * 1024 * 1024 }),
+      video: { codec: 'avc', width: w, height: h, frameRate: 30 },
+      audio: { codec: 'aac', numberOfChannels: 1, sampleRate: sr },
+      fastStart: false,
+      firstTimestampBehavior: 'offset',
+    });
+    let failed = null;
+    const venc = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => failed = e });
+    venc.configure(vcfg);
+    const aenc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: (e) => failed = e });
+    aenc.configure(acfg);
+
+    // Audio: mic → worklet → AAC, timestamps from the sample count
+    const src = actx.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+    const node = new AudioWorkletNode(actx, 'cap');
+    const mute = actx.createGain(); mute.gain.value = 0;
+    src.connect(node); node.connect(mute); mute.connect(actx.destination);
+    let samples = 0, pend = [], pendLen = 0;
+    function flushAudio() {
+      if (!pendLen) return;
+      const buf = new Float32Array(pendLen); let o = 0;
+      for (const p of pend) { buf.set(p, o); o += p.length; }
+      const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: pendLen, numberOfChannels: 1,
+        timestamp: Math.round(samples * 1e6 / sr), data: buf });
+      aenc.encode(ad); ad.close();
+      samples += pendLen; pend = []; pendLen = 0;
+    }
+    node.port.onmessage = (e) => { pend.push(e.data); pendLen += e.data.length; if (pendLen >= 2048) flushAudio(); };
+
+    // Video: fixed 30fps timeline
+    const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const t0 = performance.now(); let n = 0;
+    function pump() {
+      const target = Math.floor((performance.now() - t0) * 30 / 1000) + 1;
+      if (n >= target) return;
+      ctx.drawImage(cam, 0, 0, w, h);
+      while (n < target) {
+        const f = new VideoFrame(canvas, { timestamp: Math.round(n * 1e6 / 30), duration: Math.round(1e6 / 30) });
+        venc.encode(f, { keyFrame: n % 30 === 0 }); f.close(); n++;
+      }
+    }
+    pump();
+    const iv = setInterval(pump, 8);
+
+    return {
+      mode: 'cfr',
+      async stop() {
+        clearInterval(iv); pump();
+        node.port.onmessage = null; flushAudio();
+        try { src.disconnect(); node.disconnect(); mute.disconnect(); } catch {}
+        await venc.flush(); await aenc.flush();
+        muxer.finalize();
+        venc.close(); aenc.close(); actx.close().catch(() => {});
+        if (failed) throw failed;
+        return { blob: sink.blob('video/mp4'), ext: 'mp4' };
+      }
+    };
+  }
+
+  function startMediaRecorder() {
+    if (!window.MediaRecorder) throw new Error('no MediaRecorder');
+    const types = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+    const type = types.find(t => MediaRecorder.isTypeSupported?.(t)) || '';
+    let rec;
+    try { rec = new MediaRecorder(stream, type ? { mimeType: type, videoBitsPerSecond: s.hd ? 8e6 : 4e6 } : undefined); }
+    catch { rec = new MediaRecorder(stream); }
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.start(1000);
+    return {
+      mode: 'mr',
+      stop: () => new Promise((resolve) => {
+        rec.onstop = () => {
+          const mt = rec.mimeType || type || 'video/mp4';
+          resolve({ blob: new Blob(chunks, { type: mt }), ext: mt.includes('mp4') ? 'mp4' : 'webm' });
+        };
+        rec.stop();
+      })
+    };
+  }
+
   async function countdown() {
     if (!s.countdown) return;
     const c = $('count'); c.hidden = false;
     for (let i = 3; i > 0; i--) { c.textContent = i; await new Promise(r => setTimeout(r, 1000)); }
     c.hidden = true;
   }
+
   async function startRec() {
     if (!stream) { toast('相機還沒準備好'); return; }
-    if (!window.MediaRecorder) { toast('這個瀏覽器不支援錄影'); return; }
+    // AudioContext must be created inside the tap
+    let actx = null;
+    if (s.cfr && 'AudioContext' in window) { try { actx = new AudioContext(); actx.resume(); } catch { actx = null; } }
     $('recBtn').disabled = true;
     scroller.scrollTop = 0; setRunning(false);
+    const cfrOk = actx && await CFR_SUPPORTED;
+    if (cfrOk) { try { await prepareAudio(actx); } catch (e) { console.warn(e); } }
     await countdown();
-    const type = pickType();
-    try { recorder = new MediaRecorder(stream, type ? { mimeType: type, videoBitsPerSecond: s.hd ? 8_000_000 : 4_000_000 } : undefined); }
-    catch { recorder = new MediaRecorder(stream); }
-    lastExt = (recorder.mimeType || type).includes('mp4') ? 'mp4' : 'webm';
-    chunks = [];
-    recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-    recorder.onstop = showResult;
-    recorder.start(1000);
+    session = null;
+    if (cfrOk) {
+      try { session = await startCfr(actx); }
+      catch (e) { console.warn('CFR failed, falling back', e); toast('改用一般錄影模式'); }
+    } else if (actx) { actx.close().catch(() => {}); }
+    if (!session) {
+      try { session = startMediaRecorder(); }
+      catch { toast('這個瀏覽器不支援錄影'); $('recBtn').disabled = false; return; }
+    }
     recording = true; recStart = Date.now();
     $('recBtn').disabled = false; $('recBtn').classList.add('on'); $('recBtn').setAttribute('aria-label', '停止錄影');
     $('recTime').hidden = false; updateTime(); timer = setInterval(updateTime, 500);
@@ -321,14 +474,24 @@
     setRunning(true);
     wakeLock();
   }
-  function stopRec() {
-    if (!recorder) return;
+
+  async function stopRec() {
+    if (!session || !recording) return;
     recording = false; setRunning(false);
     clearInterval(timer); $('recTime').hidden = true;
     $('recBtn').classList.remove('on'); $('recBtn').setAttribute('aria-label', '開始錄影');
+    $('recBtn').disabled = true;
+    const s0 = session; session = null;
+    try {
+      const { blob, ext } = await s0.stop();
+      lastExt = ext; showResult(blob, s0.mode);
+    } catch (e) {
+      console.error(e); toast('存檔失敗，請再錄一次');
+    }
+    $('recBtn').disabled = false;
     $('editBtn').disabled = $('flipBtn').disabled = false;
-    recorder.stop();
   }
+
   function updateTime() {
     const sec = Math.floor((Date.now() - recStart) / 1000);
     $('recTime').textContent = String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(sec % 60).padStart(2, '0');
@@ -338,12 +501,12 @@
     return `提詞錄影_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${lastExt}`;
   }
   let lastUrl = '';
-  function showResult() {
-    lastBlob = new Blob(chunks, { type: recorder.mimeType || (lastExt === 'mp4' ? 'video/mp4' : 'video/webm') });
+  function showResult(blob, mode) {
+    lastBlob = blob;
     if (lastUrl) URL.revokeObjectURL(lastUrl);
     lastUrl = URL.createObjectURL(lastBlob);
     $('playback').src = lastUrl;
-    $('resultInfo').textContent = (lastBlob.size / 1048576).toFixed(1) + ' MB';
+    $('resultInfo').textContent = (lastBlob.size / 1048576).toFixed(1) + ' MB・' + (mode === 'cfr' ? '剪輯友善 30fps' : '一般模式');
     $('result').hidden = false;
   }
   async function saveVideo() {
@@ -398,6 +561,8 @@
   bindToggle('tCountdown', 'countdown');
   bindToggle('tMirror', 'mirror');
   bindToggle('tHD', 'hd', startCamera);
+  bindToggle('tCfr', 'cfr');
+  CFR_SUPPORTED.then(ok => { if (!ok) { const el = $('tCfr'); el.disabled = true; el.setAttribute('aria-pressed', 'false'); el.textContent = '剪輯友善模式（這支手機不支援）'; } });
 
   // Keyboard / Bluetooth remote
   document.addEventListener('keydown', (e) => {
