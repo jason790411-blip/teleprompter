@@ -33,7 +33,18 @@
 
   /* Camera */
   #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
-  #cam.mirror { transform: scaleX(-1); }
+  #cam.mirror, #view.mirror { transform: scaleX(-1); }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; background: #000; }
+
+  /* Beauty */
+  #beautyBtn { position: fixed; z-index: 6; right: max(14px, var(--safe-r)); top: calc(var(--ph, 42%) + 10px);
+    display: flex; align-items: center; gap: 6px; padding: 8px 14px 8px 10px; border-radius: 999px;
+    background: rgba(0,0,0,.45); border: 1px solid var(--line); font-size: 14px; font-weight: 600; }
+  #beautyBtn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #beautyBtn[aria-pressed="true"] { color: var(--accent); border-color: rgba(255,204,51,.5); }
+  #beautyBtn:disabled { opacity: .4; }
+  .sheet.see-through { background: transparent; }
+  .sheet.see-through .card { max-height: none; }
   #camMsg { position: fixed; inset: 0; display: grid; place-items: center; padding: calc(var(--ph, 42%) * 0 + 45vh) 32px 140px; text-align: center;
     color: var(--muted); line-height: 1.7; }
   #camMsg button { margin-top: 16px; padding: 12px 22px; border-radius: 999px; background: var(--accent); color: #111; font-weight: 700; }
@@ -121,6 +132,7 @@
 <body>
 
 <video id="cam" playsinline autoplay muted></video>
+<canvas id="view" hidden></canvas>
 <div id="camMsg" hidden></div>
 
 <div id="prompter">
@@ -130,6 +142,11 @@
 </div>
 
 <div id="recTime" hidden>00:00</div>
+
+<button id="beautyBtn" aria-pressed="false" hidden>
+  <svg viewBox="0 0 24 24"><path d="M12 3l1.8 4.7L18.5 9l-4.7 1.8L12 15.5l-1.8-4.7L5.5 9l4.7-1.3z"/><path d="M18 15l.8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8z"/></svg>
+  <span id="beautyLabel">美肌</span>
+</button>
 
 <div id="bar">
   <div class="side">
@@ -182,6 +199,19 @@
   </div>
 </div>
 
+<!-- Beauty panel: transparent backdrop so the face stays visible while adjusting -->
+<div class="sheet see-through" id="beautySheet" hidden>
+  <div class="card">
+    <div class="head"><h2>美肌</h2><button class="done" id="beautyDone">完成</button></div>
+    <div class="row"><label for="smooth">磨皮</label><input type="range" id="smooth" min="0" max="100" step="5"><output id="smoothOut"></output></div>
+    <div class="row"><label for="white">美白</label><input type="range" id="white" min="0" max="100" step="5"><output id="whiteOut"></output></div>
+    <div class="toggles">
+      <button class="chip" id="tBeauty" aria-pressed="true">開啟美肌</button>
+    </div>
+    <p class="hint">效果會一起錄進影片。磨皮主要作用在膚色的地方，眼睛、頭髮和背景的輪廓會盡量保留。</p>
+  </div>
+</div>
+
 <!-- Result sheet -->
 <div class="sheet" id="result" hidden>
   <div class="card">
@@ -201,7 +231,7 @@
 <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.min.js"></script>
 <script>
 (() => {
-  const VERSION = 'v4（11/24 音訊修正）';
+  const VERSION = 'v5（11/26 美肌）';
   const $ = (id) => document.getElementById(id);
   const cam = $('cam'), scroller = $('scroller'), textEl = $('text');
   const store = {
@@ -216,6 +246,7 @@
     fs: store.get('fs', 30), speed: store.get('speed', 5), ph: store.get('ph', 42), dim: store.get('dim', 60),
     center: store.get('center', false), flipText: store.get('flipText', false), countdown: store.get('countdown', true),
     mirror: store.get('mirror', true), hd: store.get('hd', true), cfr: store.get('cfr', true), facing: store.get('facing', 'user'),
+    beauty: store.get('beauty', true), smooth: store.get('smooth', 50), white: store.get('white', 20),
   };
 
   // ---------- Prompter display ----------
@@ -227,6 +258,9 @@
     r.setProperty('--align', s.center ? 'center' : 'left');
     textEl.classList.toggle('flip', s.flipText);
     cam.classList.toggle('mirror', s.mirror && s.facing === 'user');
+    $('view').classList.toggle('mirror', s.mirror && s.facing === 'user');
+    $('beautyBtn').setAttribute('aria-pressed', s.beauty);
+    $('beautyLabel').textContent = s.beauty ? '美肌 開' : '美肌 關';
     $('speedVal').textContent = s.speed;
   }
   function renderText() { textEl.textContent = s.script.trim() ? s.script : '（還沒有講稿，按左下角的鉛筆圖示貼上講稿）'; }
@@ -263,6 +297,94 @@
   });
   scroller.addEventListener('click', toggleRun); // mouse only; taps are handled above
 
+  // ---------- Beauty renderer (WebGL) ----------
+  // Camera frames go through a shader: edge-preserving smoothing weighted toward skin tones, then a
+  // brightening curve. The preview shows this canvas, and the recorder encodes from it.
+  const view = $('view');
+  const VS = 'attribute vec2 p;varying vec2 uv;void main(){uv=vec2(p.x*.5+.5,.5-p.y*.5);gl_Position=vec4(p,0.,1.);}';
+  const FS = `precision highp float;
+varying vec2 uv;
+uniform sampler2D tex;
+uniform vec2 texel;
+uniform float smoothAmt;
+uniform float whiteAmt;
+float luma(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }
+void main(){
+  vec3 c = texture2D(tex, uv).rgb;
+  vec3 o = c;
+  if (smoothAmt > 0.0) {
+    float cb = -0.168736*c.r - 0.331264*c.g + 0.5*c.b + 0.5;
+    float cr =  0.5*c.r - 0.418688*c.g - 0.081312*c.b + 0.5;
+    float skin = smoothstep(0.27, 0.32, cb) * (1.0 - smoothstep(0.50, 0.55, cb))
+               * smoothstep(0.50, 0.54, cr) * (1.0 - smoothstep(0.68, 0.73, cr));
+    vec2 r = texel * (3.0 + 7.0 * smoothAmt);
+    float lc = luma(c);
+    vec3 sum = c; float ws = 1.0;
+    for (int ring = 1; ring <= 3; ring++) {
+      float fr = float(ring);
+      for (int k = 0; k < 8; k++) {
+        float a = float(k) * 0.785398 + fr * 0.392699;
+        vec3 s = texture2D(tex, uv + vec2(cos(a), sin(a)) * r * fr).rgb;
+        float d = luma(s) - lc;
+        float w = exp(-d * d * 220.0) * (1.25 - 0.25 * fr);
+        sum += s * w; ws += w;
+      }
+    }
+    vec3 blur = sum / ws;
+    o = mix(c, blur, smoothAmt * (0.2 + 0.8 * skin));
+  }
+  if (whiteAmt > 0.0) {
+    float b = 1.0 + whiteAmt * 3.0;
+    o = log(o * (b - 1.0) + 1.0) / log(b);
+  }
+  gl_FragColor = vec4(o, 1.0);
+}`;
+  const glr = (() => {
+    let gl;
+    try { gl = view.getContext('webgl', { preserveDrawingBuffer: true, alpha: false, antialias: false, premultipliedAlpha: false }); } catch {}
+    if (!gl) return null;
+    function sh(type, src) { const x = gl.createShader(type); gl.shaderSource(x, src); gl.compileShader(x);
+      if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(x)); return x; }
+    try {
+      const prog = gl.createProgram();
+      gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+      gl.useProgram(prog);
+      const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const u = { texel: gl.getUniformLocation(prog, 'texel'), smooth: gl.getUniformLocation(prog, 'smoothAmt'), white: gl.getUniformLocation(prog, 'whiteAmt') };
+      gl.uniform1i(gl.getUniformLocation(prog, 'tex'), 0);
+      let ready = false;
+      function draw() {
+        const w = cam.videoWidth, h = cam.videoHeight;
+        if (!w || !h || cam.readyState < 2) return;
+        if (view.width !== w || view.height !== h) { view.width = w; view.height = h; gl.viewport(0, 0, w, h); gl.uniform2f(u.texel, 1 / w, 1 / h); }
+        try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cam); } catch { return; }
+        gl.uniform1f(u.smooth, s.beauty ? s.smooth / 100 : 0);
+        gl.uniform1f(u.white, s.beauty ? s.white / 100 : 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        if (!ready) { ready = true; view.hidden = false; }
+      }
+      // Draw on each animation frame, but only when the camera has a new frame (or if that signal goes quiet)
+      let fresh = true, lastFresh = 0, driven = false;
+      function watchFrames() {
+        if (!('requestVideoFrameCallback' in cam)) return;
+        const onF = () => { fresh = true; lastFresh = performance.now(); cam.requestVideoFrameCallback(onF); };
+        cam.requestVideoFrameCallback(onF);
+      }
+      const loop = () => { if (!driven && (fresh || performance.now() - lastFresh > 100)) { fresh = false; draw(); } requestAnimationFrame(loop); };
+      // While recording, the recorder calls drawNow() for every frame it encodes, so it never depends on animation timing
+      return { start() { watchFrames(); loop(); }, watchFrames, drawNow: draw, set driven(v) { driven = v; }, get ready() { return ready; } };
+    } catch (e) { console.warn('beauty renderer unavailable', e); return null; }
+  })();
+  // Frame source for the recorder: the filtered canvas once it has drawn, else the raw camera
+  const frameSource = () => (glr && glr.ready ? view : cam);
+
   // ---------- Camera ----------
   let stream = null;
   async function startCamera() {
@@ -271,7 +393,12 @@
     if (location.hash === '#test') { // test-only fake camera + tone, used for desktop checks
       const c = document.createElement('canvas'); c.width = 1080; c.height = 1920;
       const g = c.getContext('2d'); let i = 0;
-      setInterval(() => { g.fillStyle = `hsl(${(i++ * 7) % 360} 60% 40%)`; g.fillRect(0, 0, 1080, 1920); g.fillStyle = '#fff'; g.font = '200px sans-serif'; g.fillText(i, 300, 1000); }, 33);
+      const face = document.createElement('canvas'); face.width = 700; face.height = 900;
+      { const f = face.getContext('2d'); f.fillStyle = '#d8a07c'; f.beginPath(); f.ellipse(350, 450, 340, 440, 0, 0, 7); f.fill();
+        for (let k = 0; k < 2500; k++) { f.fillStyle = `rgba(${120 + Math.random() * 60},${60 + Math.random() * 40},40,${Math.random() * .35})`;
+          f.beginPath(); f.arc(350 + (Math.random() - .5) * 560, 450 + (Math.random() - .5) * 720, 2 + Math.random() * 5, 0, 7); f.fill(); }
+        f.fillStyle = '#222'; f.beginPath(); f.ellipse(230, 380, 50, 22, 0, 0, 7); f.ellipse(470, 380, 50, 22, 0, 0, 7); f.fill(); }
+      setInterval(() => { g.fillStyle = `hsl(${(i++ * 2) % 360} 30% 35%)`; g.fillRect(0, 0, 1080, 1920); g.drawImage(face, 190, 700); g.fillStyle = '#fff'; g.font = '120px sans-serif'; g.fillText(i, 60, 1800); }, 33);
       const ac = new AudioContext(), osc = ac.createOscillator(), dst = ac.createMediaStreamDestination();
       osc.connect(dst); osc.start();
       stream = new MediaStream([...c.captureStream(30).getVideoTracks(), ...dst.stream.getAudioTracks()]);
@@ -290,6 +417,7 @@
       });
       cam.srcObject = stream; msg.hidden = true;
       await cam.play().catch(() => {});
+      glr && glr.watchFrames();
     } catch (err) {
       msg.hidden = false;
       msg.innerHTML = '';
@@ -425,11 +553,14 @@
     // Video: fixed 30fps timeline
     const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext('2d', { alpha: false });
+    if (glr && glr.ready) glr.driven = true;
     const t0 = performance.now(); let n = 0;
     function pump() {
       const target = Math.floor((performance.now() - t0) * 30 / 1000) + 1;
       if (n >= target) return;
-      ctx.drawImage(cam, 0, 0, w, h);
+      const src = frameSource();
+      if (src === view) glr.drawNow();
+      ctx.drawImage(src, 0, 0, w, h);
       while (n < target) {
         const f = new VideoFrame(canvas, { timestamp: Math.round(n * 1e6 / 30), duration: Math.round(1e6 / 30) });
         venc.encode(f, { keyFrame: n % 30 === 0 }); f.close(); n++;
@@ -442,6 +573,7 @@
       mode: 'cfr',
       async stop() {
         clearInterval(iv); pump();
+        if (glr) glr.driven = false;
         clearTimeout(audioWatch);
         if (node) node.port.onmessage = null;
         if (sp) sp.onaudioprocess = null;
@@ -462,8 +594,10 @@
     const types = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
     const type = types.find(t => MediaRecorder.isTypeSupported?.(t)) || '';
     let rec;
-    try { rec = new MediaRecorder(stream, type ? { mimeType: type, videoBitsPerSecond: s.hd ? 8e6 : 4e6 } : undefined); }
-    catch { rec = new MediaRecorder(stream); }
+    const src = frameSource() === view && view.captureStream
+      ? new MediaStream([...view.captureStream(30).getVideoTracks(), ...stream.getAudioTracks()]) : stream;
+    try { rec = new MediaRecorder(src, type ? { mimeType: type, videoBitsPerSecond: s.hd ? 8e6 : 4e6 } : undefined); }
+    catch { rec = new MediaRecorder(src); }
     const chunks = [];
     rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
     rec.start(1000);
@@ -508,7 +642,7 @@
     recording = true; recStart = Date.now();
     $('recBtn').disabled = false; $('recBtn').classList.add('on'); $('recBtn').setAttribute('aria-label', '停止錄影');
     $('recTime').hidden = false; updateTime(); timer = setInterval(updateTime, 500);
-    $('editBtn').disabled = $('flipBtn').disabled = true;
+    $('editBtn').disabled = $('flipBtn').disabled = $('beautyBtn').disabled = true;
     setRunning(true);
     wakeLock();
   }
@@ -527,7 +661,7 @@
       console.error(e); toast('存檔失敗，請再錄一次');
     }
     $('recBtn').disabled = false;
-    $('editBtn').disabled = $('flipBtn').disabled = false;
+    $('editBtn').disabled = $('flipBtn').disabled = $('beautyBtn').disabled = false;
   }
 
   function updateTime() {
@@ -605,6 +739,13 @@
   bindToggle('tMirror', 'mirror');
   bindToggle('tHD', 'hd', startCamera);
   bindToggle('tCfr', 'cfr');
+  bindRange('smooth', 'smooth', v => v);
+  bindRange('white', 'white', v => v);
+  bindToggle('tBeauty', 'beauty');
+  $('beautyBtn').onclick = () => { setRunning(false); $('tBeauty').setAttribute('aria-pressed', s.beauty); $('beautySheet').hidden = false; };
+  $('beautyDone').onclick = () => { $('beautySheet').hidden = true; };
+  $('beautySheet').addEventListener('click', (e) => { if (e.target.id === 'beautySheet') $('beautySheet').hidden = true; });
+  if (glr) { $('beautyBtn').hidden = false; glr.start(); }
   CFR_SUPPORTED.then(ok => { if (!ok) { const el = $('tCfr'); el.disabled = true; el.setAttribute('aria-pressed', 'false'); el.textContent = '剪輯友善模式（這支手機不支援）'; } });
 
   // Keyboard / Bluetooth remote
